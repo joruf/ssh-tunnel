@@ -1,0 +1,14 @@
+{
+  "app_name": "SSH Tunnel",
+  "tunnels": [
+    {
+      "id": "example1",
+      "name": "Example Database",
+      "ssh_host": "example.com",
+      "ssh_user": "your-user",
+      "local_port": 3307,
+      "remote_host": "127.0.0.1",
+      "remote_port": 3306
+    }
+  ]
+}
