@@ -142,5 +142,42 @@ class RunCliTests(CliTestCase):
         self.assertEqual(ctx.exception.code, 0)
 
 
+class MainTrayFlagTests(CliTestCase):
+    def _main_with_argv(self, argv):
+        with patch.object(sys, "argv", ["run.py"] + argv):
+            return run.main()
+
+    def test_no_arguments_starts_visible_gui(self):
+        with patch.object(run, "run_gui") as mock_gui:
+            self._main_with_argv([])
+        mock_gui.assert_called_once_with(False)
+
+    def test_tray_flag_starts_hidden_gui(self):
+        with patch.object(run, "run_gui") as mock_gui:
+            self._main_with_argv(["--tray"])
+        mock_gui.assert_called_once_with(True)
+
+    def test_tray_flag_with_cli_command_exits_with_code_1(self):
+        with patch.object(run, "run_gui") as mock_gui:
+            with self.assertRaises(SystemExit) as ctx:
+                _output_of(self._main_with_argv, ["--tray", "list"])
+        mock_gui.assert_not_called()
+        self.assertEqual(ctx.exception.code, 1)
+
+
+class RunGuiTests(CliTestCase):
+    def test_tray_start_does_not_raise_existing_window(self):
+        with patch.object(core, "running_app_pid", return_value=4242), patch.object(os, "kill") as mock_kill:
+            output = _output_of(run.run_gui, True)
+        mock_kill.assert_not_called()
+        self.assertIn("nothing to do", output)
+
+    def test_normal_start_raises_existing_window(self):
+        with patch.object(core, "running_app_pid", return_value=4242), patch.object(os, "kill") as mock_kill:
+            output = _output_of(run.run_gui, False)
+        mock_kill.assert_called_once()
+        self.assertIn("bringing that window to front", output)
+
+
 if __name__ == "__main__":
     unittest.main()

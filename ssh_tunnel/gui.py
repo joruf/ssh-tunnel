@@ -231,8 +231,17 @@ class TunnelDialog(tk.Toplevel):
 
 
 class TunnelApp:
-    def __init__(self, root):
+    def __init__(self, root, start_hidden=False):
+        """
+        @param root tk.Tk The application's root window.
+        @param start_hidden bool True to stay in the system tray on start instead of
+            showing the window (used by the autostart entry via run.py --tray).
+        """
         self.root = root
+        self.start_hidden = start_hidden
+        if start_hidden:
+            # Withdraw before any widget is drawn so the window never flashes up.
+            self.root.withdraw()
         self.root.title(core.CONFIG.get("app_name", core.DEFAULT_APP_NAME))
         if os.path.isfile(core.ICON_FILE):
             self.root.iconphoto(True, tk.PhotoImage(file=core.ICON_FILE))
@@ -320,6 +329,9 @@ class TunnelApp:
             # No tray support (e.g. GTK3 bindings missing): closing the window must
             # actually quit, otherwise there would be no way to bring it back.
             self.root.protocol("WM_DELETE_WINDOW", self.quit_application)
+            if self.start_hidden:
+                # Same reason: without a tray icon, a hidden window is unreachable.
+                self.show_from_tray()
 
     def hide_to_tray(self):
         if self.tray_icon is None:
