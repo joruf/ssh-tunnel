@@ -94,6 +94,7 @@ renamed to `.env.migrated` (not deleted).
 
 ```bash
 ./run.py                          # start the GUI
+./run.py --tray                   # start hidden, only in the system tray
 ./run.py list                     # list all defined tunnels with status
 ./run.py status [name]            # show status of one tunnel, or all
 ./run.py start|stop|toggle <name> # act on one tunnel by name
@@ -109,6 +110,33 @@ system tray (if available); the tray icon's context menu has **Show** and
 Only one GUI instance runs at a time — starting `./run.py` again while it's
 already open just brings the existing window to the front instead of opening
 a duplicate.
+
+### Autostart (tray only)
+
+`./run.py --tray` starts the app straight into the system tray without showing
+the window — that's the mode meant for autostart, so a login doesn't pop the
+window into your face. Click the tray icon (or run `./run.py` again) to bring
+the window up. Without the flag the window always opens normally, so the
+manual start stays unchanged.
+
+If a tray icon isn't available (GTK3 bindings missing), `--tray` falls back to
+showing the window, since a hidden window would otherwise be unreachable. When
+an instance is already running, `--tray` just exits quietly instead of raising
+that instance's window.
+
+To autostart it, drop a desktop entry into `~/.config/autostart/`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=SSH Tunnel
+Exec=/path/to/ssh-tunnel/run.py --tray
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=6
+```
+
+The small startup delay gives the desktop's tray area time to come up before
+the icon is registered.
 
 ![Add tunnel dialog](assets/screenshot-add.png)
 

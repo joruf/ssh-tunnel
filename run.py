@@ -9,6 +9,7 @@ each tunnel can be referenced by its "name" (case-insensitive) or its "id".
 
 Usage:
     run.py                          # start the GUI
+    run.py --tray                   # start hidden, only in the system tray (autostart)
     run.py list                     # list all defined tunnels with status
     run.py status [name]            # show status of one tunnel, or all
     run.py start|stop|toggle <name> # act on one tunnel by name
@@ -22,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ssh_tunnel import core
 
 CLI_ACTIONS = {"start", "stop", "toggle"}
+TRAY_FLAG = "--tray"
 
 
 def describe(tunnel):
@@ -81,7 +83,14 @@ def run_cli(action, name):
         sys.exit(0 if ok else 1)
 
 
-def run_gui():
+def run_gui(start_hidden=False):
+    """
+    Starts the GUI, or hands over to an already running instance.
+
+    @param start_hidden bool True to start without showing the window (tray only),
+        as used by the autostart entry.
+    @return None
+    """
     import signal
     import tkinter as tk
 
@@ -89,6 +98,10 @@ def run_gui():
 
     other_pid = core.running_app_pid()
     if other_pid is not None:
+        if start_hidden:
+            # Autostart run: an instance is already there, so don't pop its window open.
+            print(f"SSH Tunnel is already running (PID {other_pid}); nothing to do.")
+            return
         os.kill(other_pid, signal.SIGUSR1)
         print(f"SSH Tunnel is already running (PID {other_pid}); bringing that window to front.")
         return
@@ -96,7 +109,7 @@ def run_gui():
     core.acquire_app_lock()
     try:
         root = tk.Tk()
-        app = TunnelApp(root)
+        app = TunnelApp(root, start_hidden=start_hidden)
         signal.signal(signal.SIGUSR1, lambda *_args: root.after(0, app.show_from_tray))
         root.mainloop()
     finally:
@@ -105,11 +118,18 @@ def run_gui():
 
 def main():
     args = sys.argv[1:]
+    start_hidden = TRAY_FLAG in args
+    if start_hidden:
+        args = [arg for arg in args if arg != TRAY_FLAG]
+        if args:
+            print(f"{TRAY_FLAG} applies to the GUI and cannot be combined with a CLI command.")
+            sys.exit(1)
+
     action = args[0] if args else None
     name = args[1] if len(args) > 1 else None
 
     if action is None:
-        run_gui()
+        run_gui(start_hidden)
     elif action == "list":
         run_list()
     elif action == "status":
