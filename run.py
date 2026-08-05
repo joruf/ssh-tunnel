@@ -110,7 +110,9 @@ def run_gui(start_hidden=False):
     try:
         root = tk.Tk()
         app = TunnelApp(root, start_hidden=start_hidden)
-        signal.signal(signal.SIGUSR1, lambda *_args: root.after(0, app.show_from_tray))
+        # request_show() only appends to a lock-free queue: safe to call from a
+        # signal handler, which may interrupt the main thread anywhere.
+        signal.signal(signal.SIGUSR1, lambda *_args: app.request_show())
         root.mainloop()
     finally:
         core.release_app_lock()
