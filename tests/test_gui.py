@@ -43,6 +43,31 @@ class TunnelFormFieldsConsistencyTests(unittest.TestCase):
         self.assertEqual(form_keys, core.TUNNEL_FIELDS)
 
 
+class FakeTrayProcess:
+    """Stands in for the tray subprocess, handing out canned protocol lines."""
+
+    def __init__(self, lines=()):
+        self._lines = list(lines)
+        self.stdout = self
+        self.terminated = False
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else ""
+
+    def __iter__(self):
+        while self._lines:
+            yield self._lines.pop(0)
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
 class TrayIconConstructionTests(unittest.TestCase):
     def test_stores_constructor_arguments_without_starting_anything(self):
         on_show = lambda: None
@@ -52,9 +77,76 @@ class TrayIconConstructionTests(unittest.TestCase):
         self.assertEqual(tray._tooltip, "Test")
         self.assertIs(tray._on_show, on_show)
         self.assertIs(tray._on_exit, on_exit)
-        self.assertIsNone(tray._thread)
-        self.assertIsNone(tray._icon)
-        self.assertIsNone(tray._menu)
+        self.assertIsNone(tray._on_lost)
+        self.assertIsNone(tray._process)
+        self.assertIsNone(tray._reader)
+
+    def test_stop_without_a_started_process_is_a_noop(self):
+        TrayIcon(icon_path="/tmp/icon.png", tooltip="Test", on_show=lambda: None, on_exit=lambda: None).stop()
+
+    def test_child_env_makes_the_package_importable(self):
+        env = TrayIcon._child_env()
+        self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], os.path.dirname(os.path.dirname(__file__)))
+
+
+class TrayIconProtocolTests(unittest.TestCase):
+    """The tray icon lives in its own process and reports back one line at a
+    time; this is the parent side of that protocol."""
+
+    def setUp(self):
+        self.shown = []
+        self.exited = []
+        self.lost = []
+
+    def tray(self, with_on_lost=False):
+        return TrayIcon(
+            icon_path="/tmp/icon.png",
+            tooltip="Test",
+            on_show=lambda: self.shown.append(True),
+            on_exit=lambda: self.exited.append(True),
+            on_lost=(lambda: self.lost.append(True)) if with_on_lost else None,
+        )
+
+    def test_show_and_exit_lines_reach_their_callbacks(self):
+        self.tray()._read_events(FakeTrayProcess(["show\n", "exit\n"]))
+        self.assertEqual(len(self.shown), 1)
+        self.assertEqual(len(self.exited), 1)
+
+    def test_unknown_lines_are_ignored(self):
+        self.tray()._read_events(FakeTrayProcess(["ready\n", "\n", "nonsense\n"]))
+        self.assertEqual(self.shown, [])
+        self.assertEqual(self.exited, [])
+
+    def test_a_tray_process_that_dies_reports_the_loss(self):
+        self.tray(with_on_lost=True)._read_events(FakeTrayProcess())
+        self.assertEqual(len(self.lost), 1)
+
+    def test_an_exit_the_user_asked_for_is_not_reported_as_a_loss(self):
+        self.tray(with_on_lost=True)._read_events(FakeTrayProcess(["exit\n"]))
+        self.assertEqual(self.lost, [])
+
+    def test_start_succeeds_once_the_child_reports_ready(self):
+        tray = self.tray()
+        process = FakeTrayProcess(["ready\n"])
+        with mock.patch("ssh_tunnel.tray.subprocess.Popen", return_value=process):
+            self.assertTrue(tray.start())
+        self.assertIs(tray._process, process)
+        tray.stop()
+        self.assertTrue(process.terminated)
+        self.assertIsNone(tray._process)
+
+    def test_start_fails_and_cleans_up_when_the_child_never_reports_ready(self):
+        tray = self.tray()
+        process = FakeTrayProcess()
+        with mock.patch("ssh_tunnel.tray.subprocess.Popen", return_value=process):
+            self.assertFalse(tray.start())
+        self.assertTrue(process.terminated)
+        self.assertIsNone(tray._process)
+
+    def test_start_fails_when_the_child_cannot_be_spawned(self):
+        tray = self.tray()
+        with mock.patch("ssh_tunnel.tray.subprocess.Popen", side_effect=OSError("no python")):
+            self.assertFalse(tray.start())
 
 
 class UiCallQueueTests(unittest.TestCase):
@@ -124,7 +216,7 @@ class StatusSamplerTests(unittest.TestCase):
 
     def sample_with(self, pid, running, listening):
         with mock.patch.object(core, "read_pid", return_value=pid), \
-             mock.patch.object(core, "is_running", return_value=running), \
+             mock.patch.object(core, "process_is_tunnel", return_value=running), \
              mock.patch.object(core, "port_is_listening", return_value=listening), \
              mock.patch.object(core, "read_io_counters", return_value=None):
             return self.sampler.sample()
@@ -167,7 +259,7 @@ class StatusSamplerTests(unittest.TestCase):
         snapshots = []
         sampler = StatusSampler(on_snapshot=snapshots.append, interval_seconds=0.01)
         with mock.patch.object(core, "read_pid", return_value=None), \
-             mock.patch.object(core, "is_running", return_value=False):
+             mock.patch.object(core, "process_is_tunnel", return_value=False):
             sampler.start()
             sampler._thread.join(timeout=0.1)  # keeps sampling until stop() is honoured
             self.assertTrue(sampler._thread.is_alive())

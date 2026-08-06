@@ -120,9 +120,16 @@ the window up. Without the flag the window always opens normally, so the
 manual start stays unchanged.
 
 If a tray icon isn't available (GTK3 bindings missing), `--tray` falls back to
-showing the window, since a hidden window would otherwise be unreachable. When
-an instance is already running, `--tray` just exits quietly instead of raising
-that instance's window.
+showing the window, since a hidden window would otherwise be unreachable. The
+same happens if the tray icon disappears later on. When an instance is already
+running, `--tray` just exits quietly instead of raising that instance's window.
+
+The tray icon runs as a separate process (`ssh_tunnel/tray_process.py`) on
+purpose. Tk and GTK each drive their own event loop over their own Xlib
+connection, and hosting both in one process made the GUI freeze: the window
+stayed on screen but stopped reacting to clicks. Should it ever stop responding
+again, `kill -USR2 <pid>` writes every thread's stack to stderr
+(`~/.xsession-errors` under a desktop session).
 
 To autostart it, drop a desktop entry into `~/.config/autostart/`:
 
@@ -167,7 +174,8 @@ run.py                    entry point (GUI by default, CLI actions as arguments)
 ssh_tunnel/
     core.py                tunnel start/stop/status, tunnels.json loading/saving
     gui.py                 Tkinter GUI (tunnel list, add/edit/remove dialogs)
-    tray.py                GTK3 system tray icon
+    tray.py                starts/talks to the tray process (no GTK in the GUI process)
+    tray_process.py        the GTK3 system tray icon itself, as its own process
 tests/
     test_core.py           unit tests for ssh_tunnel/core.py
     test_gui.py             unit tests for the display-independent parts of ssh_tunnel/gui.py and tray.py
