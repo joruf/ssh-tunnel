@@ -131,7 +131,11 @@ def apply_theme(widget):
         darkcolor=BORDER,
         font="TkDefaultFont 11",
     )
-    style.map("Tunnels.Treeview", background=[("selected", "#e4e4e7")], foreground=[("selected", FG)])
+    # Selection is a background change only. Mapping a foreground for the
+    # "selected" state would win over the row's tag colour, and since a double
+    # click both selects a row and toggles its tunnel, the green a successful
+    # connection is supposed to show would never actually appear.
+    style.map("Tunnels.Treeview", background=[("selected", "#e4e4e7")], foreground=[])
     style.configure(
         "Tunnels.Treeview.Heading",
         padding=(10, 8),
