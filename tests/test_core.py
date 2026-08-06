@@ -1,6 +1,7 @@
 """Tests for ssh_tunnel.core. All config/PID/log paths are patched to temp
 locations so these tests never touch the real tunnels.json or ~/.cache/ssh-tunnel."""
 
+import contextlib
 import json
 import os
 import socket
@@ -13,6 +14,28 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ssh_tunnel import core
+
+
+@contextlib.contextmanager
+def fake_ssh_process(*args):
+    """
+    Runs a stand-in for ssh: an interpreter reached through a symlink named
+    "ssh", started with the given arguments. That gives the PID checks a
+    realistic argv (argv[0] ends in "ssh", the -L forward is in there) without
+    opening a real SSH connection.
+
+    @param args str Arguments to pass after the "ssh" name.
+    @return subprocess.Popen The running stand-in, killed on exit.
+    """
+    with tempfile.TemporaryDirectory() as bin_dir:
+        fake_ssh = os.path.join(bin_dir, "ssh")
+        os.symlink(sys.executable, fake_ssh)
+        proc = subprocess.Popen([fake_ssh, "-c", "import time; time.sleep(30)", *args])
+        try:
+            yield proc
+        finally:
+            proc.kill()
+            proc.wait()
 
 
 class LoadEnvTests(unittest.TestCase):
@@ -192,6 +215,104 @@ class ProcessStateTests(unittest.TestCase):
         self.assertIsNone(core.read_io_counters(999999999))
 
 
+class ProcessIdentityTests(unittest.TestCase):
+    """A pid file can outlive the ssh process it names (an ssh that only dies
+    after start_tunnel() stopped waiting leaves one behind), and PIDs get
+    reused - so a live PID on its own must never count as a running tunnel."""
+
+    TUNNEL = {
+        "id": "ident",
+        "name": "Ident",
+        "ssh_host": "host.example.com",
+        "ssh_user": "user",
+        "local_port": 3307,
+        "remote_host": "127.0.0.1",
+        "remote_port": 3306,
+    }
+
+    def test_forward_spec_is_the_ssh_l_argument(self):
+        self.assertEqual(core.forward_spec(self.TUNNEL), "3307:127.0.0.1:3306")
+
+    def test_read_cmdline_of_the_current_process(self):
+        self.assertIsNotNone(core.read_cmdline(os.getpid()))
+
+    def test_read_cmdline_is_none_for_a_dead_pid(self):
+        self.assertIsNone(core.read_cmdline(999999999))
+
+    def test_dead_or_missing_pid_is_not_the_tunnel(self):
+        self.assertFalse(core.process_is_tunnel(999999999, self.TUNNEL))
+        self.assertFalse(core.process_is_tunnel(None, self.TUNNEL))
+
+    def test_matching_ssh_process_is_the_tunnel(self):
+        forward = core.forward_spec(self.TUNNEL)
+        with fake_ssh_process("-N", "-L", forward, "user@host.example.com") as proc:
+            self.assertTrue(core.process_is_tunnel(proc.pid, self.TUNNEL))
+
+    def test_ssh_process_for_another_forward_is_not_the_tunnel(self):
+        with fake_ssh_process("-N", "-L", "9999:127.0.0.1:3306", "user@host.example.com") as proc:
+            self.assertFalse(core.process_is_tunnel(proc.pid, self.TUNNEL))
+
+    def test_unrelated_live_process_is_not_the_tunnel(self):
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            self.assertTrue(core.is_running(proc.pid))
+            self.assertFalse(core.process_is_tunnel(proc.pid, self.TUNNEL))
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+class RecycledPidTests(unittest.TestCase):
+    """What a stale pid file must not cause: a wrong "connected" state, or
+    SIGTERM to whatever unrelated process inherited that PID."""
+
+    TUNNEL = dict(ProcessIdentityTests.TUNNEL, id="recycled")
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        for patcher in (
+            patch.object(core, "RUN_DIR", self.tmp_dir.name),
+            patch.object(core, "CONFIG", {"app_name": "Test", "tunnels": [self.TUNNEL]}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        self.pid_file, _ = core.tunnel_paths(self.TUNNEL["id"])
+
+    def write_pid(self, pid):
+        with open(self.pid_file, "w") as f:
+            f.write(str(pid))
+
+    def test_pid_file_naming_a_foreign_process_is_not_running(self):
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            self.write_pid(proc.pid)
+            self.assertFalse(core.is_tunnel_running(self.TUNNEL["id"]))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_stop_tunnel_leaves_a_foreign_process_alone(self):
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            self.write_pid(proc.pid)
+            ok, msg = core.stop_tunnel(self.TUNNEL["id"])
+            self.assertTrue(ok)
+            self.assertEqual(msg, "Was not active.")
+            self.assertIsNone(proc.poll(), "an unrelated process must not be killed")
+            self.assertFalse(os.path.isfile(self.pid_file), "the stale pid file should be cleaned up")
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_pid_file_naming_the_real_ssh_process_is_running(self):
+        forward = core.forward_spec(self.TUNNEL)
+        with fake_ssh_process("-N", "-L", forward, "user@host.example.com") as proc:
+            self.write_pid(proc.pid)
+            self.assertTrue(core.is_tunnel_running(self.TUNNEL["id"]))
+
+
 class TailLogTests(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
@@ -282,26 +403,23 @@ class TunnelLifecycleTests(unittest.TestCase):
             proc.wait()
 
     def test_start_tunnel_when_already_running(self):
-        proc = subprocess.Popen(["sleep", "30"])
-        pid_file, _ = core.tunnel_paths("already-running")
-        with open(pid_file, "w") as f:
-            f.write(str(proc.pid))
-        try:
-            tunnel = {
-                "id": "already-running",
-                "name": "Already",
-                "ssh_host": "unused",
-                "ssh_user": "unused",
-                "local_port": 1,
-                "remote_host": "unused",
-                "remote_port": 1,
-            }
+        tunnel = {
+            "id": "already-running",
+            "name": "Already",
+            "ssh_host": "host.example.com",
+            "ssh_user": "user",
+            "local_port": 3398,
+            "remote_host": "127.0.0.1",
+            "remote_port": 3306,
+        }
+        forward = core.forward_spec(tunnel)
+        with fake_ssh_process("-N", "-L", forward, "user@host.example.com") as proc:
+            pid_file, _ = core.tunnel_paths(tunnel["id"])
+            with open(pid_file, "w") as f:
+                f.write(str(proc.pid))
             ok, msg = core.start_tunnel(tunnel)
             self.assertTrue(ok)
             self.assertIn("Already running", msg)
-        finally:
-            proc.kill()
-            proc.wait()
 
     def test_start_tunnel_reports_failure_and_cleans_up_pid_file(self):
         tunnel = {

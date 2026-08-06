@@ -1,94 +1,142 @@
-"""System tray integration using GTK3."""
+"""System tray integration, driven by a separate GTK3 process."""
 
 import os
+import subprocess
+import sys
 import threading
+
+APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+TRAY_MODULE = "ssh_tunnel.tray_process"
+READY_TOKEN = "ready"
+READY_TIMEOUT_SECONDS = 15
+STOP_TIMEOUT_SECONDS = 3
 
 
 class TrayIcon:
     """
-    GTK3 status icon that keeps the app available from the system tray.
+    System tray icon for the app, hosted in a child process.
 
-    The icon lives in its own GTK main loop thread, so on_show/on_exit are
-    called from that thread and MUST return immediately - they may not call into
-    Tkinter (see TunnelApp.post). A callback that blocks stops the GTK loop, and
-    with it the tray icon: while a context menu is open it also holds an X
-    pointer grab, which makes the whole desktop appear frozen.
+    The icon is a GTK3 status icon, and it deliberately does not live in the
+    GUI process. Tk and GTK each drive their own event loop over their own Xlib
+    connection, and GDK calls XInitThreads() when it initialises - which Xlib
+    only allows before the first display is opened, long after Tk has opened
+    its own. Sharing one libX11 that way eventually left the Tk main thread
+    blocked inside Xlib waiting for a reply that never arrived: the window
+    stayed on screen but stopped reacting to clicks, and a double click no
+    longer even selected a row.
+
+    In its own process each toolkit gets its own libX11 back. The two talk over
+    the child's stdout, one line per message (see ssh_tunnel.tray_process).
     """
 
-    def __init__(self, icon_path, tooltip, on_show, on_exit):
+    def __init__(self, icon_path, tooltip, on_show, on_exit, on_lost=None):
+        """
+        @param icon_path str Path to the tray icon image.
+        @param tooltip str Tooltip text for the icon.
+        @param on_show callable Called when the user asks for the window.
+        @param on_exit callable Called when the user picks "Exit".
+        @param on_lost callable|None Called if the tray process dies on its own,
+            so the GUI can stop hiding into a tray that is no longer there.
+        """
         self._icon_path = icon_path
         self._tooltip = tooltip
         self._on_show = on_show
         self._on_exit = on_exit
-        self._thread = None
-        self._icon = None
-        self._menu = None
+        self._on_lost = on_lost
+        self._process = None
+        self._reader = None
+        self._stopping = threading.Event()
 
     def start(self):
         """
-        Starts the tray icon in a background thread.
+        Starts the tray process and waits for it to report that its icon is up.
 
-        @return bool True when GTK3 tray support is available.
+        Blocks until the child is ready (or fails), so call this off the Tk main
+        thread.
+
+        @return bool True when the tray icon is showing.
         """
         try:
-            import gi
-
-            gi.require_version("Gtk", "3.0")
-        except (ImportError, ValueError):
+            process = subprocess.Popen(
+                [sys.executable, "-m", TRAY_MODULE, self._icon_path, self._tooltip],
+                cwd=APP_ROOT,
+                env=self._child_env(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError:
             return False
 
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        # The child should answer within a second; the timer is only there so a
+        # child that hangs on startup cannot keep this thread waiting forever.
+        watchdog = threading.Timer(READY_TIMEOUT_SECONDS, process.kill)
+        watchdog.start()
+        try:
+            first_line = process.stdout.readline()
+        finally:
+            watchdog.cancel()
+
+        if first_line.strip() != READY_TOKEN:
+            self._terminate(process)
+            return False
+
+        self._process = process
+        self._reader = threading.Thread(target=self._read_events, args=(process,), daemon=True)
+        self._reader.start()
         return True
 
-    def _run(self):
-        import gi
+    def stop(self):
+        """Shuts the tray process down. Safe to call more than once."""
+        self._stopping.set()
+        process, self._process = self._process, None
+        if process is not None:
+            self._terminate(process)
 
-        gi.require_version("Gdk", "3.0")
-        from gi.repository import Gdk, Gtk
+    @staticmethod
+    def _child_env():
+        """Environment for the child, with the app importable as a package."""
+        python_path = os.environ.get("PYTHONPATH", "")
+        return {
+            **os.environ,
+            "PYTHONPATH": APP_ROOT + (os.pathsep + python_path if python_path else ""),
+        }
 
+    @staticmethod
+    def _terminate(process):
+        """Ends the tray process, escalating to SIGKILL if it does not go."""
         try:
-            Gdk.notify_startup_complete()
-        except (AttributeError, TypeError):
+            process.terminate()
+            process.wait(timeout=STOP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        except OSError:
             pass
 
-        icon = Gtk.StatusIcon()
-        self._icon = icon
-        if os.path.isfile(self._icon_path):
-            icon.set_from_file(self._icon_path)
-        icon.set_tooltip_text(self._tooltip)
-        icon.connect("activate", self._handle_show)
-        icon.connect("popup-menu", self._popup_menu)
-        icon.set_visible(True)
+    def _read_events(self, process):
+        """
+        Turns the child's protocol lines into callbacks. Runs in its own thread,
+        so the callbacks must not touch Tkinter directly (see TunnelApp.post).
 
-        Gtk.main()
+        @param process subprocess.Popen The tray process to read from.
+        @return None
+        """
+        for line in process.stdout:
+            command = line.strip()
+            if command == "show":
+                self._on_show()
+            elif command == "exit":
+                # Expected shutdown: the child quits right after this line, so
+                # its closing stdout below must not be reported as a crash.
+                self._stopping.set()
+                self._on_exit()
 
-    def _handle_show(self, *_args):
-        self._on_show()
-
-    def _popup_menu(self, _icon, button, activate_time):
-        from gi.repository import Gtk
-
-        menu = Gtk.Menu()
-        # Keep the menu referenced: nothing else owns it while it is popped up,
-        # so letting it go out of scope can have Python garbage-collect it right
-        # after the click - the menu then never appears (or vanishes at once).
-        self._menu = menu
-
-        show_item = Gtk.MenuItem(label="Show")
-        show_item.connect("activate", self._handle_show)
-        show_item.show()
-        menu.append(show_item)
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        exit_item = Gtk.MenuItem(label="Exit")
-        exit_item.connect("activate", self._handle_exit)
-        exit_item.show()
-        menu.append(exit_item)
-
-        menu.show()
-        menu.popup(None, None, None, None, button, activate_time)
-
-    def _handle_exit(self, *_args):
-        self._on_exit()
+        # stdout is closed, so the tray process has ended - either because it
+        # was told to (Exit, or stop()), or because it died. In the latter case
+        # the GUI must be told, or the window could be hidden into a tray that
+        # no longer exists and become unreachable.
+        if not self._stopping.is_set() and self._on_lost is not None:
+            self._on_lost()

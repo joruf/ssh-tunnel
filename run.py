@@ -91,10 +91,18 @@ def run_gui(start_hidden=False):
         as used by the autostart entry.
     @return None
     """
+    import faulthandler
     import signal
     import tkinter as tk
 
     from ssh_tunnel.gui import TunnelApp
+
+    # If the GUI ever stops responding again, "kill -USR2 <pid>" writes every
+    # thread's stack to stderr (~/.xsession-errors under a desktop session).
+    # faulthandler dumps from the signal handler itself, so it still answers
+    # when the main thread is stuck somewhere inside C code.
+    faulthandler.enable()
+    faulthandler.register(signal.SIGUSR2, all_threads=True, chain=False)
 
     other_pid = core.running_app_pid()
     if other_pid is not None:

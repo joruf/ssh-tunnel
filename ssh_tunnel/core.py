@@ -24,7 +24,18 @@ DEFAULT_APP_NAME = "SSH Tunnel"
 RUN_DIR = os.path.expanduser("~/.cache/ssh-tunnel")
 APP_LOCK_FILE = os.path.join(RUN_DIR, "app.pid")
 
+# /proc lets a PID be cross-checked against the process it is supposed to name.
+HAVE_PROC = os.path.isdir("/proc/self")
+
 TUNNEL_FIELDS = ["name", "ssh_host", "ssh_user", "local_port", "remote_host", "remote_port"]
+
+# How long start_tunnel() waits for ssh to either forward the port or give up.
+# Generous on purpose: a hostname that does not resolve can keep ssh busy for
+# some 15 seconds, and stopping to wait before that verdict is in means
+# reporting "started" for a tunnel that is about to die - the failure then goes
+# unreported and the entry just falls back to disconnected on its own.
+START_TIMEOUT_SECONDS = 30
+START_POLL_SECONDS = 0.25
 
 
 def load_env(path):
@@ -178,9 +189,67 @@ def is_running(pid):
         return False
 
 
+def forward_spec(tunnel):
+    """The ssh -L argument that identifies this tunnel's process."""
+    return f"{tunnel['local_port']}:{tunnel['remote_host']}:{tunnel['remote_port']}"
+
+
+def read_cmdline(pid):
+    """
+    Reads a process's argument vector from /proc.
+
+    @param pid int Process id.
+    @return list[str]|None The arguments, or None when they cannot be read
+        (process already gone, or no /proc on this platform).
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    return [arg for arg in raw.decode(errors="replace").split("\0") if arg] or None
+
+
+def process_is_tunnel(pid, tunnel):
+    """
+    Confirms a PID really is this tunnel's ssh process, not just some live PID.
+
+    PIDs get reused, and a pid file can outlive the process it names: an ssh
+    that only dies after start_tunnel() stopped waiting for it (a slow DNS
+    failure, say) leaves one behind. Trusting such a PID would show the tunnel
+    as connected - and disconnecting it would send SIGTERM to whatever
+    unrelated process has meanwhile inherited that number.
+
+    @param pid int|None PID from the tunnel's pid file.
+    @param tunnel dict The tunnel it is supposed to belong to.
+    @return bool True when that process exists and is this tunnel's forward.
+    """
+    if not is_running(pid):
+        return False
+    if not HAVE_PROC:
+        # Nothing to cross-check against here, so liveness has to do.
+        return True
+    cmdline = read_cmdline(pid)
+    if cmdline is None:
+        return False
+    return os.path.basename(cmdline[0]).endswith("ssh") and forward_spec(tunnel) in cmdline
+
+
 def is_tunnel_running(tunnel_id):
+    """
+    Whether this tunnel's ssh process is up.
+
+    @param tunnel_id str Tunnel id (or name).
+    @return bool True when the tunnel is running.
+    """
     pid_file, _ = tunnel_paths(tunnel_id)
-    return is_running(read_pid(pid_file))
+    pid = read_pid(pid_file)
+    tunnel = find_tunnel(tunnel_id)
+    if tunnel is None:
+        # Not a configured tunnel (e.g. one being removed): liveness is all
+        # there is to go on.
+        return is_running(pid)
+    return process_is_tunnel(pid, tunnel)
 
 
 def running_app_pid():
@@ -252,7 +321,7 @@ def start_tunnel(tunnel):
     """Starts the given tunnel. Returns (success: bool, message: str)."""
     pid_file, log_file = tunnel_paths(tunnel["id"])
     pid = read_pid(pid_file)
-    if is_running(pid):
+    if process_is_tunnel(pid, tunnel):
         return True, f"Already running (PID {pid})."
 
     os.makedirs(RUN_DIR, exist_ok=True)
@@ -271,12 +340,12 @@ def start_tunnel(tunnel):
     with open(pid_file, "w") as f:
         f.write(str(proc.pid))
 
-    # Give SSH a moment to either establish the tunnel or fail (e.g. auth error).
-    # Uses proc.poll() rather than is_running(): for our own child, is_running()'s
-    # os.kill(pid, 0) still succeeds while the process is a not-yet-reaped zombie,
-    # which would misreport an immediate failure (e.g. DNS/auth) as still starting.
-    for _ in range(20):
-        time.sleep(0.25)
+    # Wait for SSH to either establish the tunnel or fail (auth error, unknown
+    # host, ...). Uses proc.poll() rather than is_running(): for our own child,
+    # is_running()'s os.kill(pid, 0) still succeeds while the process is a
+    # not-yet-reaped zombie, which would misreport a failure as still starting.
+    for _ in range(int(START_TIMEOUT_SECONDS / START_POLL_SECONDS)):
+        time.sleep(START_POLL_SECONDS)
         if proc.poll() is not None:
             break
         if port_is_listening(tunnel["local_port"]):
@@ -295,7 +364,9 @@ def stop_tunnel(tunnel_id):
     """Stops the given tunnel. Returns (success: bool, message: str)."""
     pid_file, _ = tunnel_paths(tunnel_id)
     pid = read_pid(pid_file)
-    if not is_running(pid):
+    # is_tunnel_running() rather than is_running(): a pid file left behind by a
+    # dead tunnel must never get an unrelated process killed (process_is_tunnel).
+    if not is_tunnel_running(tunnel_id):
         if os.path.isfile(pid_file):
             os.remove(pid_file)
         return True, "Was not active."

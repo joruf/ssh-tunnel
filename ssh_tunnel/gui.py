@@ -250,7 +250,7 @@ class StatusSampler:
             tunnel_id = tunnel["id"]
             pid_file, _ = core.tunnel_paths(tunnel_id)
             pid = core.read_pid(pid_file)
-            running = core.is_running(pid)
+            running = core.process_is_tunnel(pid, tunnel)
             if not running:
                 status_text, tag = "● Disconnected", "disconnected"
             elif core.port_is_listening(tunnel["local_port"]):
@@ -532,31 +532,68 @@ class TunnelApp:
         threading.Thread(target=work, args=args, daemon=True).start()
 
     def pump(self):
-        """Runs queued cross-thread callbacks and applies the newest snapshot."""
-        self.ui_calls.drain(should_stop=lambda: self.exiting)
-        if self.exiting:
-            return
-        self.apply_status()
-        self.root.after(UI_QUEUE_INTERVAL_MS, self.pump)
+        """
+        Runs queued cross-thread callbacks and applies the newest snapshot.
+
+        The reschedule sits in a finally block on purpose: this timer is the
+        only route from the worker threads and the tray into the GUI, so a
+        single failing callback must not be able to stop it for good.
+        """
+        try:
+            self.ui_calls.drain(should_stop=lambda: self.exiting)
+            if self.exiting:
+                return
+            self.apply_status()
+        finally:
+            if not self.exiting:
+                self.root.after(UI_QUEUE_INTERVAL_MS, self.pump)
 
     # -- tray -----------------------------------------------------------
 
     def start_tray_icon(self):
+        """Brings up the tray icon; the wait for it happens off the main thread."""
         tray = TrayIcon(
             icon_path=core.ICON_FILE,
             tooltip=core.CONFIG.get("app_name", core.DEFAULT_APP_NAME),
             on_show=self.request_show,
             on_exit=lambda: self.post(self.quit_application),
+            on_lost=lambda: self.post(self.tray_unavailable),
         )
-        if tray.start():
+        self.run_in_background(self.do_start_tray, tray)
+
+    def do_start_tray(self, tray):
+        """
+        Starts the tray process. Runs in a worker thread because starting it
+        waits for the tray process to report its icon is up, so it must not
+        touch Tkinter - the result goes back through post().
+
+        @param tray TrayIcon The tray icon to start.
+        @return None
+        """
+        started = tray.start()
+        self.post(lambda: self.finish_tray_start(tray, started))
+
+    def finish_tray_start(self, tray, started):
+        """Applies a finished tray start on the Tk main thread."""
+        if self.exiting:
+            tray.stop()
+            return
+        if started:
             self.tray_icon = tray
-        else:
-            # No tray support (e.g. GTK3 bindings missing): closing the window must
-            # actually quit, otherwise there would be no way to bring it back.
-            self.root.protocol("WM_DELETE_WINDOW", self.quit_application)
-            if self.start_hidden:
-                # Same reason: without a tray icon, a hidden window is unreachable.
-                self.show_from_tray()
+            return
+        self.tray_unavailable()
+
+    def tray_unavailable(self):
+        """
+        Drops back to a plain window, because there is no tray icon: either the
+        desktop has no GTK3 support, or the tray process died. Closing the
+        window then has to really quit and a hidden window has to come back -
+        otherwise the app would keep running with no way to reach it.
+        """
+        self.tray_icon = None
+        self.root.protocol("WM_DELETE_WINDOW", self.quit_application)
+        if self.root.state() == "withdrawn":
+            self.show_from_tray()
 
     def hide_to_tray(self):
         if self.tray_icon is None:
@@ -588,6 +625,8 @@ class TunnelApp:
             return
         self.exiting = True
         self.sampler.stop()
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
         self.root.destroy()
 
     # -- tunnel CRUD --------------------------------------------------------
