@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SSH Tunnel
+GenericName=SSH port forwarding
+Comment=Switch local SSH port-forwards on and off from one list
+Comment[de]=Lokale SSH-Portweiterleitungen aus einer Liste ein- und ausschalten
+# %k is this .desktop file, so ./run.py is always the one in the same folder.
+Exec=/bin/bash -c "cd \\$(dirname \\$(readlink -f \\$0)) && exec python3 ./run.py" %k
+Icon=ssh-tunnel
+Terminal=false
+Categories=Network;Utility;
+Keywords=ssh;tunnel;port;forward;bastion;Tunnel;
+StartupNotify=false
