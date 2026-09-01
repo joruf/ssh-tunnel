@@ -5,9 +5,12 @@ Name=SSH Tunnel
 GenericName=SSH port forwarding
 Comment=Switch local SSH port-forwards on and off from one list
 Comment[de]=Lokale SSH-Portweiterleitungen aus einer Liste ein- und ausschalten
-# %k is this .desktop file, so ./run.py is always the one in the same folder.
-Exec=/bin/bash -c "cd \\$(dirname \\$(readlink -f \\$0)) && exec python3 ./run.py" %k
-Icon=ssh-tunnel
+# %k is the path of this file, so the program beside it is the one that starts -- wherever the
+# folder was copied to. The same path repairs Icon= in place: a .desktop file cannot point at its
+# icon with a relative path (the spec reads one as a theme name), so the launcher writes the
+# absolute path of the icon next to it whenever the folder has moved.
+Exec=/bin/bash -c "s=\\$(readlink -f \\"\\$0\\"); d=\\${s%/*}; i=\\$d/assets/icon.png; grep -qxF \\"Icon=\\$i\\" \\"\\$s\\" || { I=\\$i awk '/^Icon=/{print \\"Icon=\\" ENVIRON[\\"I\\"]; next}1' \\"\\$s\\" > \\"\\$s.new\\" && mv -f \\"\\$s.new\\" \\"\\$s\\"; }; cd \\"\\$d\\" && exec python3 ./run.py" %k
+Icon=/home/joruf/Applications/ssh-tunnel/assets/icon.png
 Terminal=false
 Categories=Network;Utility;
 Keywords=ssh;tunnel;port;forward;bastion;Tunnel;
